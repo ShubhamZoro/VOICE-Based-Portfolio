@@ -1,6 +1,6 @@
-# client.py
+# app.py
 
-# 1️⃣ Monkey patch must be first
+# 1️⃣ Eventlet monkey patch must be first
 import eventlet
 eventlet.monkey_patch()
 
@@ -20,7 +20,7 @@ from flask_socketio import SocketIO
 from common.agent_functions import FUNCTION_MAP
 from common.agent_templates import AgentTemplates, AGENT_AUDIO_SAMPLE_RATE
 
-# 3️⃣ Flask app and SocketIO (eventlet async mode)
+# 3️⃣ Flask app + SocketIO (eventlet async mode)
 app = Flask(__name__, static_folder="./static", static_url_path="/", template_folder="templates")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
@@ -29,9 +29,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
 
-# 5️⃣ Global voice agent
+# 5️⃣ Global VoiceAgent
 VOICE_AGENT = None
-
 
 # 6️⃣ VoiceAgent class
 class VoiceAgent:
@@ -47,22 +46,32 @@ class VoiceAgent:
     def set_loop(self, loop):
         self.loop = loop
 
-    async def setup(self):
+    async def setup(self, retries=3, delay=2):
         dg_api_key = os.environ.get("DEEPGRAM_API_KEY")
         if not dg_api_key:
             logger.error("DEEPGRAM_API_KEY env var not present")
             return False
+
+        url = self.agent_templates.voice_agent_url
         settings = self.agent_templates.settings
-        try:
-            self.ws = await websockets.connect(
-                self.agent_templates.voice_agent_url,
-                extra_headers={"Authorization": f"Token {dg_api_key}"}
-            )
-            await self.ws.send(json.dumps(settings))
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to Deepgram: {e}")
-            return False
+
+        for attempt in range(1, retries + 1):
+            try:
+                logger.info(f"[Attempt {attempt}] Connecting to Deepgram WS at {url} ...")
+                self.ws = await websockets.connect(
+                    url,
+                    extra_headers={"Authorization": f"Token {dg_api_key}"},
+                    ping_interval=None
+                )
+                await self.ws.send(json.dumps(settings))
+                logger.info("Connected to Deepgram WS successfully")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to connect on attempt {attempt}: {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    return False
 
     async def sender(self):
         try:
@@ -142,38 +151,20 @@ class VoiceAgent:
         except Exception as e:
             logger.error(f"receiver error: {e}")
 
-    async def keepalive(self):
-        """Send ping to keep WS alive"""
-        while self.is_running and self.ws:
-            try:
-                await self.ws.send("ping")
-            except Exception:
-                break
-            await asyncio.sleep(20)
-
     async def run(self):
-        """Reconnect loop to survive disconnects"""
-        while True:
-            if not await self.setup():
-                logger.error("Setup failed, retrying in 5s...")
-                await asyncio.sleep(5)
-                continue
-
-            self.is_running = True
-            try:
-                await asyncio.gather(self.sender(), self.receiver(), self.keepalive())
-            except Exception as e:
-                logger.error(f"run loop error: {e}")
-            finally:
-                self.is_running = False
-                if self.ws:
-                    try:
-                        await self.ws.close()
-                    except:
-                        pass
-                logger.info("Reconnecting in 3s...")
-                await asyncio.sleep(3)
-
+        if not await self.setup():
+            logger.error("Voice agent setup failed.")
+            return
+        self.is_running = True
+        try:
+            await asyncio.gather(self.sender(), self.receiver())
+        finally:
+            self.is_running = False
+            if self.ws:
+                try:
+                    await self.ws.close()
+                except:
+                    pass
 
 # 7️⃣ Speaker class
 class Speaker:
@@ -200,7 +191,6 @@ class Speaker:
     async def play(self, data):
         return await self._queue.async_q.put(data)
 
-
 def _play(audio_out, stop):
     seq = 0
     while not stop.is_set():
@@ -211,8 +201,7 @@ def _play(audio_out, stop):
         except queue.Empty:
             pass
 
-
-# 8️⃣ Run async agent in background
+# 8️⃣ Run async agent in background (Eventlet compatible)
 def run_async_voice_agent():
     global VOICE_AGENT
     loop = asyncio.new_event_loop()
@@ -223,39 +212,47 @@ def run_async_voice_agent():
     finally:
         try:
             pending = asyncio.all_tasks(loop)
-            for t in pending:
-                t.cancel()
+            for t in pending: t.cancel()
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
             loop.close()
 
-
 # 9️⃣ Routes
 @app.route("/")
 def index():
     return render_template("index.html")
-
 
 @app.route("/tts-models")
 def get_tts_models():
     try:
         dg_api_key = os.environ.get("DEEPGRAM_API_KEY")
         if not dg_api_key:
-            return jsonify({"models": []})
+            return jsonify({"error": "DEEPGRAM_API_KEY not set"}), 500
         response = requests.get("https://api.deepgram.com/v1/models",
                                 headers={"Authorization": f"Token {dg_api_key}"})
         if response.status_code != 200:
-            return jsonify({"models": []})
+            return jsonify({"error": f"API status {response.status_code}"}), 500
         data = response.json()
-        return jsonify({"models": data.get("tts", [])})
+        formatted = []
+        if "tts" in data:
+            for model in data["tts"]:
+                if model.get("architecture") == "aura-2":
+                    lang = (model.get("languages") or ["en"])[0]
+                    md = model.get("metadata", {})
+                    formatted.append({
+                        "name": model.get("canonical_name", model.get("name")),
+                        "display_name": model.get("name"),
+                        "language": lang,
+                        "accent": md.get("accent", ""),
+                        "tags": ", ".join(md.get("tags", [])),
+                    })
+        return jsonify({"models": formatted})
     except Exception as e:
-        logger.error(f"/tts-models error: {e}")
-        return jsonify({"models": []})
+        return jsonify({"error": str(e)}), 500
 
-
-# 🔟 SocketIO handlers
+# 1️⃣0️⃣ SocketIO handlers
 @socketio.on("start_voice_agent")
 def handle_start_voice_agent(data=None):
     global VOICE_AGENT
@@ -265,14 +262,12 @@ def handle_start_voice_agent(data=None):
         VOICE_AGENT = VoiceAgent(voiceModel=voiceModel, voiceName=voiceName, browser_audio=True)
         socketio.start_background_task(target=run_async_voice_agent)
 
-
 @socketio.on("stop_voice_agent")
 def handle_stop_voice_agent():
     global VOICE_AGENT
     if VOICE_AGENT:
         VOICE_AGENT.is_running = False
         VOICE_AGENT = None
-
 
 @socketio.on("audio_data")
 def handle_audio_data(data):
@@ -289,12 +284,9 @@ def handle_audio_data(data):
             else:
                 audio_bytes = bytes(audio_buffer)
             if VOICE_AGENT.loop and not VOICE_AGENT.loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    VOICE_AGENT.mic_audio_queue.put(audio_bytes), VOICE_AGENT.loop
-                )
+                asyncio.run_coroutine_threadsafe(VOICE_AGENT.mic_audio_queue.put(audio_bytes), VOICE_AGENT.loop)
         except Exception as e:
             logger.error(f"audio_data error: {e}")
-
 
 # 1️⃣1️⃣ Main entry
 if __name__ == "__main__":
