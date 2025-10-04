@@ -6,7 +6,7 @@ from common.agent_functions import FUNCTION_MAP
 from common.agent_templates import AgentTemplates, AGENT_AUDIO_SAMPLE_RATE
 
 app = Flask(__name__, static_folder="./static", static_url_path="/", template_folder="templates")
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*",async_mode="eventlet")
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
@@ -262,3 +262,4 @@ def handle_audio_data(data):
 if __name__ == "__main__":
     print("\nOpen http://127.0.0.1:5000\n")
     socketio.run(app, debug=True)
+
