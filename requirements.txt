@@ -7,3 +7,4 @@ python-dotenv==1.0.0
 requests==2.32.3
 openai>=1.40
 python-docx
+gunicorn
