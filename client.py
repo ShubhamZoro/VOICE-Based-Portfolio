@@ -1,4 +1,3 @@
-# client.py
 from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO
 import asyncio, websockets, os, json, threading, janus, queue, requests, logging
