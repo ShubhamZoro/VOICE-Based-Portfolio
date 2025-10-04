@@ -1,18 +1,38 @@
+# client.py
+
+# 1️⃣ Monkey patch must be first
+import eventlet
+eventlet.monkey_patch()
+
+# 2️⃣ Standard imports
+import os
+import json
+import threading
+import queue
+import logging
+import requests
+import asyncio
+import janus
+import websockets
 
 from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO
-import asyncio, websockets, os, json, threading, janus, queue, requests, logging
 from common.agent_functions import FUNCTION_MAP
 from common.agent_templates import AgentTemplates, AGENT_AUDIO_SAMPLE_RATE
 
+# 3️⃣ Flask app and SocketIO (eventlet async mode)
 app = Flask(__name__, static_folder="./static", static_url_path="/", template_folder="templates")
-socketio = SocketIO(app, cors_allowed_origins="*",async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
+# 4️⃣ Logger setup
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
 
+# 5️⃣ Global voice agent
 VOICE_AGENT = None
 
+# 6️⃣ VoiceAgent class
 class VoiceAgent:
     def __init__(self, voiceModel="aura-2-apollo-en", voiceName="", browser_audio=True):
         self.mic_audio_queue = asyncio.Queue()
@@ -54,7 +74,7 @@ class VoiceAgent:
 
     async def receiver(self):
         try:
-            self.speaker = Speaker(browser_output=True)  # stream audio to browser
+            self.speaker = Speaker(browser_output=True)
             with self.speaker:
                 async for message in self.ws:
                     if isinstance(message, str):
@@ -67,7 +87,6 @@ class VoiceAgent:
                         if t == "ConversationText":
                             socketio.emit("conversation_update", msg)
 
-                        # boundary events forwarded so FE can close active bubble
                         if t in ("UserStartedSpeaking", "AgentAudioDone"):
                             socketio.emit("agent_event", msg)
 
@@ -76,16 +95,12 @@ class VoiceAgent:
                             name = fn.get("name")
                             call_id = fn.get("id")
                             params = json.loads(fn.get("arguments", "{}"))
-
                             try:
                                 impl = FUNCTION_MAP.get(name)
                                 if not impl:
                                     raise ValueError(f"Unknown function: {name}")
-
-                                # functions that require websocket (filler/end_call)
                                 if name in ["agent_filler", "end_call"]:
                                     result = await impl(self.ws, params)
-                                    # send response first
                                     resp = {
                                         "type": "FunctionCallResponse",
                                         "id": call_id,
@@ -93,7 +108,6 @@ class VoiceAgent:
                                         "content": json.dumps(result["function_response"]),
                                     }
                                     await self.ws.send(json.dumps(resp))
-                                    # then inject message / close if needed
                                     await self.ws.send(json.dumps(result["inject_message"]))
                                     if name == "end_call":
                                         await asyncio.sleep(0.5)
@@ -109,7 +123,6 @@ class VoiceAgent:
                                         "content": json.dumps(result),
                                     }
                                     await self.ws.send(json.dumps(resp))
-
                             except Exception as e:
                                 resp = {
                                     "type": "FunctionCallResponse",
@@ -140,6 +153,7 @@ class VoiceAgent:
                 try: await self.ws.close()
                 except: pass
 
+# 7️⃣ Speaker class
 class Speaker:
     def __init__(self, browser_output=True):
         self._queue = None
@@ -152,6 +166,7 @@ class Speaker:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=_play, args=(self._queue, self._stop), daemon=True)
         self._thread.start()
+        return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self._stop.set()
@@ -168,12 +183,12 @@ def _play(audio_out, stop):
     while not stop.is_set():
         try:
             data = audio_out.sync_q.get(True, 0.05)
-            # stream raw PCM to browser via socket
             socketio.emit("audio_output", {"audio": data, "sampleRate": AGENT_AUDIO_SAMPLE_RATE, "seq": seq})
             seq += 1
         except queue.Empty:
             pass
 
+# 8️⃣ Run async agent in background
 def run_async_voice_agent():
     global VOICE_AGENT
     loop = asyncio.new_event_loop()
@@ -191,7 +206,7 @@ def run_async_voice_agent():
         finally:
             loop.close()
 
-# --- routes ---
+# 9️⃣ Routes
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -224,6 +239,7 @@ def get_tts_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# 1️⃣0️⃣ SocketIO handlers
 @socketio.on("start_voice_agent")
 def handle_start_voice_agent(data=None):
     global VOICE_AGENT
@@ -259,7 +275,7 @@ def handle_audio_data(data):
         except Exception as e:
             logger.error(f"audio_data error: {e}")
 
+# 1️⃣1️⃣ Main entry
 if __name__ == "__main__":
     print("\nOpen http://127.0.0.1:5000\n")
-    socketio.run(app, debug=True)
-
+    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
