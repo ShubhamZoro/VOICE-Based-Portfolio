@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Shubham Chat Bot</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 0; background:#0f1115; color:#e6e6e6; }
+    .main { display:flex; height:100vh; }
+    .sidebar { width:320px; border-right:1px solid #222; padding:16px; box-sizing:border-box; }
+    .content { flex:1; display:flex; flex-direction:column; }
+    .header { padding:16px; border-bottom:1px solid #222; }
+    .timeline { flex:1; overflow:auto; padding:16px; }
+    .message { padding:10px 12px; border-radius:10px; margin:8px 0; max-width:70%; white-space:pre-wrap; line-height:1.4; }
+    .user { background:#1f2430; align-self:flex-end; }
+    .assistant { background:#141922; align-self:flex-start; }
+    .row { margin:12px 0; }
+    .btn { background:#4953f2; color:white; border:none; padding:10px 12px; border-radius:8px; cursor:pointer; }
+    select { width:100%; padding:8px; border-radius:8px; background:#141922; color:#eee; border:1px solid #333; }
+    .status { font-size:12px; color:#a2a2a2; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <div class="main">
+    <div class="sidebar">
+      <h2>Shubham Chat Bot</h2>
+      <div class="row">
+        <label for="voiceModel">Voice Model</label>
+        <select id="voiceModel"></select>
+      </div>
+      <div class="row">
+        <button id="startBtn" class="btn">Start Voice Agent</button>
+      </div>
+      <div class="status" id="status">Microphone: Not active</div>
+    </div>
+    <div class="content">
+      <div class="header">Conversation</div>
+      <div id="conversation" class="timeline"></div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    const startBtn = document.getElementById('startBtn');
+    const statusDiv = document.getElementById('status');
+    const convo = document.getElementById('conversation');
+    const voiceModelSelect = document.getElementById('voiceModel');
+
+    let isActive = false;
+    let audioContext, mediaStream, processor, microphone;
+    let audioOutputContext = null, lastSeq = -1, nextPlayTime = 0, audioOutputSampleRate = 16000;
+
+    // Load TTS models and preselect Apollo
+    fetch('/tts-models').then(r=>r.json()).then(data=>{
+      voiceModelSelect.innerHTML = '';
+      (data.models||[]).forEach(m=>{
+        const opt = document.createElement('option');
+        opt.value = m.name;
+        opt.text = `${m.display_name || m.name} (${m.language||'en'})`;
+        voiceModelSelect.appendChild(opt);
+      });
+      const wanted = 'aura-2-apollo-en';
+      const idx = [...voiceModelSelect.options].findIndex(o => o.value === wanted);
+      voiceModelSelect.selectedIndex = idx >= 0 ? idx : 0;
+    });
+
+    // --- Single-bubble merge logic ---
+    let activeBubble = null;
+    let activeRole = null;
+
+    function ensureBubble(role) {
+      if (!activeBubble || activeRole !== role) {
+        activeBubble = document.createElement('div');
+        activeBubble.className = `message ${role}`;
+        activeRole = role;
+        convo.appendChild(activeBubble);
+      }
+      return activeBubble;
+    }
+
+    function appendToBubble(role, text) {
+      const el = ensureBubble(role);
+      if (el.textContent) el.textContent += '\n';
+      el.textContent += text;
+      convo.scrollTop = convo.scrollHeight;
+    }
+
+    // Streamed text chunks → append
+    socket.on('conversation_update', (data) => {
+      appendToBubble(data.role, data.content);
+    });
+
+    // Boundary events → close active bubble
+    socket.on('agent_event', (data) => {
+      if (data.type === 'AgentAudioDone' || data.type === 'UserStartedSpeaking') {
+        activeBubble = null;
+        activeRole = null;
+      }
+    });
+
+    socket.on('audio_output', (data) => {
+      if (!isActive) return;
+      if (typeof data.seq === 'number') {
+        if (lastSeq !== -1 && data.seq !== lastSeq + 1) {
+          console.warn('Audio out-of-order', data.seq);
+        }
+        lastSeq = data.seq;
+      }
+      playAudioOutput(data.audio, data.sampleRate);
+    });
+
+    async function requestMic() {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+        s.getTracks().forEach(t=>t.stop());
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    async function startAudioCapture() {
+      try {
+        let stream;
+        try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+        catch (e) { alert('Mic permission required'); return false; }
+
+        mediaStream = stream;
+        audioContext = new (window.AudioContext||window.webkitAudioContext)();
+        microphone = audioContext.createMediaStreamSource(mediaStream);
+        const bufferSize = 4096;
+        processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+        microphone.connect(processor);
+        processor.connect(audioContext.destination);
+        processor.onaudioprocess = function(e) {
+          if (!isActive) return;
+          const inputData = e.inputBuffer.getChannelData(0);
+          const pcm = new Int16Array(inputData.length);
+          for (let i=0;i<inputData.length;i++) {
+            pcm[i] = Math.max(-32768, Math.min(32767, Math.floor(inputData[i]*32767)));
+          }
+          socket.emit('audio_data', { audio: pcm, sampleRate: audioContext.sampleRate });
+        };
+        return true;
+      } catch (e) {
+        alert('Audio init error: ' + e.message);
+        return false;
+      }
+    }
+
+    function stopAudioCapture() {
+      if (processor) { processor.disconnect(); processor = null; }
+      if (microphone) { microphone.disconnect(); microphone = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t=>t.stop()); mediaStream = null; }
+      if (audioContext && audioContext.state !== 'closed') { audioContext.close(); audioContext = null; }
+      stopAudioOutput();
+    }
+
+    function playAudioOutput(audioData, sampleRate) {
+      if (!audioOutputContext) {
+        audioOutputContext = new (window.AudioContext || window.webkitAudioContext)();
+        nextPlayTime = audioOutputContext.currentTime;
+      }
+      if (sampleRate) audioOutputSampleRate = sampleRate;
+      const pcm = new Int16Array(audioData);
+      const floatData = new Float32Array(pcm.length);
+      for (let i=0;i<pcm.length;i++) floatData[i]=pcm[i]/32768.0;
+      const buf = audioOutputContext.createBuffer(1, floatData.length, audioOutputSampleRate);
+      buf.getChannelData(0).set(floatData);
+      scheduleAudioBuffer(buf);
+    }
+
+    function scheduleAudioBuffer(buf) {
+      const src = audioOutputContext.createBufferSource();
+      src.buffer = buf;
+      const gain = audioOutputContext.createGain();
+      gain.gain.value = 1.0;
+      src.connect(gain); gain.connect(audioOutputContext.destination);
+      const now = audioOutputContext.currentTime;
+      const dur = buf.duration;
+      if (nextPlayTime <= now + 0.03) nextPlayTime = now + 0.03;
+      src.start(nextPlayTime);
+      nextPlayTime += dur;
+    }
+
+    function stopAudioOutput() {
+      nextPlayTime = 0; lastSeq = -1;
+      if (audioOutputContext && audioOutputContext.state!=='closed') { audioOutputContext.close(); audioOutputContext=null; }
+    }
+
+    startBtn.addEventListener('click', async () => {
+      if (!isActive) {
+        statusDiv.textContent = 'Initializing microphone...';
+        if (!await requestMic()) { statusDiv.textContent = 'Microphone: Permission denied'; return; }
+        if (!await startAudioCapture()) { statusDiv.textContent = 'Microphone: Failed'; return; }
+        socket.emit('start_voice_agent', { voiceModel: voiceModelSelect.value, voiceName: '' });
+        startBtn.textContent = 'Stop Voice Agent';
+        statusDiv.textContent = 'Microphone: Active';
+        isActive = true;
+      } else {
+        socket.emit('stop_voice_agent');
+        stopAudioCapture();
+        startBtn.textContent = 'Start Voice Agent';
+        statusDiv.textContent = 'Microphone: Not active';
+        isActive = false;
+      }
+    });
+  </script>
+</body>
+</html>
