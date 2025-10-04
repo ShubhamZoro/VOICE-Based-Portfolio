@@ -39,12 +39,8 @@ class VoiceAgent:
         self.speaker = None
         self.ws = None
         self.is_running = False
-        self.loop = None
         self.browser_audio = browser_audio
         self.agent_templates = AgentTemplates(voiceModel, voiceName)
-
-    def set_loop(self, loop):
-        self.loop = loop
 
     async def setup(self):
         dg_api_key = os.environ.get("DEEPGRAM_API_KEY")
@@ -67,7 +63,7 @@ class VoiceAgent:
         try:
             while self.is_running:
                 data = await self.mic_audio_queue.get()
-                if self.ws and self.ws.open and data:
+                if self.ws and data:
                     await self.ws.send(data)
         except Exception as e:
             logger.error(f"sender error: {e}")
@@ -86,10 +82,8 @@ class VoiceAgent:
                         t = msg.get("type")
                         if t == "ConversationText":
                             socketio.emit("conversation_update", msg)
-
                         if t in ("UserStartedSpeaking", "AgentAudioDone"):
                             socketio.emit("agent_event", msg)
-
                         elif t == "FunctionCallRequest":
                             fn = msg.get("functions", [])[0]
                             name = fn.get("name")
@@ -131,11 +125,9 @@ class VoiceAgent:
                                     "content": json.dumps({"error": str(e)}),
                                 }
                                 await self.ws.send(json.dumps(resp))
-
                         elif t == "CloseConnection":
                             await self.ws.close()
                             break
-
                     elif isinstance(message, bytes):
                         await self.speaker.play(message)
         except Exception as e:
@@ -188,23 +180,12 @@ def _play(audio_out, stop):
         except queue.Empty:
             pass
 
-# 8️⃣ Run async agent in background
+# 8️⃣ Run async agent in background safely
 def run_async_voice_agent():
     global VOICE_AGENT
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    VOICE_AGENT.set_loop(loop)
-    try:
-        loop.run_until_complete(VOICE_AGENT.run())
-    finally:
-        try:
-            pending = asyncio.all_tasks(loop)
-            for t in pending: t.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        finally:
-            loop.close()
+    if VOICE_AGENT:
+        # Schedule run in existing event loop
+        asyncio.run(VOICE_AGENT.run())
 
 # 9️⃣ Routes
 @app.route("/")
@@ -243,7 +224,6 @@ def get_tts_models():
 @socketio.on("start_voice_agent")
 def handle_start_voice_agent(data=None):
     global VOICE_AGENT
-    # Stop previous agent if exists
     if VOICE_AGENT:
         VOICE_AGENT.is_running = False
         VOICE_AGENT = None
@@ -251,7 +231,9 @@ def handle_start_voice_agent(data=None):
     voiceModel = data.get("voiceModel", "aura-2-apollo-en") if data else "aura-2-apollo-en"
     voiceName = data.get("voiceName", "") if data else ""
     VOICE_AGENT = VoiceAgent(voiceModel=voiceModel, voiceName=voiceName, browser_audio=True)
-    socketio.start_background_task(target=run_async_voice_agent)
+
+    # ✅ Run in background safely
+    socketio.start_background_task(asyncio.run, VOICE_AGENT.run())
 
 @socketio.on("stop_voice_agent")
 def handle_stop_voice_agent():
@@ -264,30 +246,19 @@ def handle_stop_voice_agent():
 def handle_audio_data(data):
     global VOICE_AGENT
     if VOICE_AGENT and VOICE_AGENT.is_running and VOICE_AGENT.browser_audio:
-        if VOICE_AGENT.ws and VOICE_AGENT.ws.open:
-            audio_buffer = data.get("audio")
-            if not audio_buffer:
-                return
-            try:
-                if isinstance(audio_buffer, memoryview):
-                    audio_bytes = audio_buffer.tobytes()
-                elif isinstance(audio_buffer, bytes):
-                    audio_bytes = audio_buffer
-                else:
-                    audio_bytes = bytes(audio_buffer)
-                if VOICE_AGENT.loop and not VOICE_AGENT.loop.is_closed():
-                    asyncio.run_coroutine_threadsafe(VOICE_AGENT.mic_audio_queue.put(audio_bytes), VOICE_AGENT.loop)
-            except Exception as e:
-                logger.error(f"audio_data error: {e}")
-
-# 🔹 Handle browser disconnect
-@socketio.on("disconnect")
-def handle_disconnect():
-    global VOICE_AGENT
-    if VOICE_AGENT:
-        logger.info("Client disconnected, stopping VoiceAgent")
-        VOICE_AGENT.is_running = False
-        VOICE_AGENT = None
+        audio_buffer = data.get("audio")
+        if not audio_buffer:
+            return
+        try:
+            if isinstance(audio_buffer, memoryview):
+                audio_bytes = audio_buffer.tobytes()
+            elif isinstance(audio_buffer, bytes):
+                audio_bytes = audio_buffer
+            else:
+                audio_bytes = bytes(audio_buffer)
+            asyncio.run_coroutine_threadsafe(VOICE_AGENT.mic_audio_queue.put(audio_bytes), asyncio.get_event_loop())
+        except Exception as e:
+            logger.error(f"audio_data error: {e}")
 
 # 1️⃣1️⃣ Main entry
 if __name__ == "__main__":
