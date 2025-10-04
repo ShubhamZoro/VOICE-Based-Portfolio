@@ -31,6 +31,8 @@ logger.addHandler(logging.StreamHandler())
 
 # 5️⃣ Global voice agent
 VOICE_AGENT = None
+AGENT_LOOP = None
+AGENT_THREAD = None
 
 # 6️⃣ VoiceAgent class
 class VoiceAgent:
@@ -180,12 +182,20 @@ def _play(audio_out, stop):
         except queue.Empty:
             pass
 
-# 8️⃣ Run async agent in background safely
-def run_async_voice_agent():
-    global VOICE_AGENT
-    if VOICE_AGENT:
-        # Schedule run in existing event loop
-        asyncio.run(VOICE_AGENT.run())
+# 8️⃣ Run asyncio loop in a separate thread
+def run_async_loop_in_thread(loop):
+    """Run asyncio event loop in a dedicated thread"""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def start_agent_loop():
+    """Initialize and start the asyncio event loop in a background thread"""
+    global AGENT_LOOP, AGENT_THREAD
+    if AGENT_LOOP is None or AGENT_LOOP.is_closed():
+        AGENT_LOOP = asyncio.new_event_loop()
+        AGENT_THREAD = threading.Thread(target=run_async_loop_in_thread, args=(AGENT_LOOP,), daemon=True)
+        AGENT_THREAD.start()
+    return AGENT_LOOP
 
 # 9️⃣ Routes
 @app.route("/")
@@ -224,6 +234,8 @@ def get_tts_models():
 @socketio.on("start_voice_agent")
 def handle_start_voice_agent(data=None):
     global VOICE_AGENT
+    
+    # Stop existing agent if running
     if VOICE_AGENT:
         VOICE_AGENT.is_running = False
         VOICE_AGENT = None
@@ -232,8 +244,11 @@ def handle_start_voice_agent(data=None):
     voiceName = data.get("voiceName", "") if data else ""
     VOICE_AGENT = VoiceAgent(voiceModel=voiceModel, voiceName=voiceName, browser_audio=True)
 
-    # ✅ Run in background safely
-    socketio.start_background_task(asyncio.run, VOICE_AGENT.run())
+    # Get or create the asyncio loop running in background thread
+    loop = start_agent_loop()
+    
+    # Schedule the coroutine in the dedicated asyncio loop
+    asyncio.run_coroutine_threadsafe(VOICE_AGENT.run(), loop)
 
 @socketio.on("stop_voice_agent")
 def handle_stop_voice_agent():
@@ -244,8 +259,8 @@ def handle_stop_voice_agent():
 
 @socketio.on("audio_data")
 def handle_audio_data(data):
-    global VOICE_AGENT
-    if VOICE_AGENT and VOICE_AGENT.is_running and VOICE_AGENT.browser_audio:
+    global VOICE_AGENT, AGENT_LOOP
+    if VOICE_AGENT and VOICE_AGENT.is_running and VOICE_AGENT.browser_audio and AGENT_LOOP:
         audio_buffer = data.get("audio")
         if not audio_buffer:
             return
@@ -256,7 +271,8 @@ def handle_audio_data(data):
                 audio_bytes = audio_buffer
             else:
                 audio_bytes = bytes(audio_buffer)
-            asyncio.run_coroutine_threadsafe(VOICE_AGENT.mic_audio_queue.put(audio_bytes), asyncio.get_event_loop())
+            # Put audio data into queue via the dedicated asyncio loop
+            asyncio.run_coroutine_threadsafe(VOICE_AGENT.mic_audio_queue.put(audio_bytes), AGENT_LOOP)
         except Exception as e:
             logger.error(f"audio_data error: {e}")
 
