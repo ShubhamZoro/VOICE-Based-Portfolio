@@ -13,7 +13,7 @@ Rules:
 - Do not reply in Markdown way it should not say ** as star star. Important point
 - all the thing written in docs is already done
 - Always respond in plain natural language.
-- Do NOT use Markdown, code blocks, or formatting symbols (no **bold**, `backticks`, or ### headers).
+- Respond ONLY in plain text, do NOT include Markdown, asterisks, or code blocks..
 - Write answers exactly as you would say them aloud.
 
 """
